@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.ResolveInfo
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.ColorFilter
 import android.graphics.LinearGradient
 import android.graphics.Paint
@@ -18,6 +19,7 @@ import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.Shader
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
@@ -31,6 +33,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.widget.*
 import java.util.Collections
 import java.util.Locale
@@ -41,11 +44,12 @@ import java.util.concurrent.TimeUnit
 class MainActivity : Activity() {
 
     private class Entry(val label: String, val pkg: String, val cls: String, val info: ResolveInfo) {
-        var icon: Drawable? = null
+        var art: Drawable? = null
+        var isBanner = false
     }
 
     private companion object {
-        const val COLS = 8
+        const val COLS = 5
         const val NORMAL = Color.WHITE
         const val MOVING = 0xFFFFC107.toInt()
     }
@@ -68,11 +72,6 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun selector(color: Int) = GradientDrawable().apply {
-        setColor(0x33FFFFFF)
-        cornerRadius = dp(12).toFloat()
-        setStroke(dp(2), color)
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -80,6 +79,7 @@ class MainActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = Backdrop()
+            clipChildren = false
             setPadding(dp(48), dp(32), dp(48), dp(16))
         }
 
@@ -107,11 +107,17 @@ class MainActivity : Activity() {
         grid = GridView(this).apply {
             numColumns = COLS
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            verticalSpacing = dp(16)
-            horizontalSpacing = dp(16)
+            verticalSpacing = dp(24)
+            horizontalSpacing = dp(20)
             clipToPadding = false
-            setPadding(0, dp(24), 0, dp(24))
-            selector = selector(NORMAL)
+            clipChildren = false
+            setPadding(dp(8), dp(28), dp(8), dp(28))
+            selector = ColorDrawable(Color.TRANSPARENT)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) { styleAll() }
+                override fun onNothingSelected(p: AdapterView<*>?) {}
+            }
+            setOnFocusChangeListener { _, _ -> styleAll() }
             adapter = AppAdapter()
             setOnItemClickListener { _, _, pos, _ -> launch(entries[pos]) }
             setOnItemLongClickListener { _, _, pos, _ -> menu(pos); true }
@@ -305,14 +311,12 @@ class MainActivity : Activity() {
 
     private fun startMove(pos: Int) {
         movingPos = pos
-        grid.selector = selector(MOVING)
         (grid.adapter as BaseAdapter).notifyDataSetChanged()
         Toast.makeText(this, "Move with arrows, press OK to drop", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopMove() {
         movingPos = -1
-        grid.selector = selector(NORMAL)
         saveOrder()
         (grid.adapter as BaseAdapter).notifyDataSetChanged()
     }
@@ -346,54 +350,141 @@ class MainActivity : Activity() {
         }
     }
 
+    // 16:9 rounded tile that clips its artwork to the rounded outline.
+    private inner class Tile(ctx: Context) : FrameLayout(ctx) {
+        val art = ImageView(ctx)
+
+        init {
+            addView(art, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, dp(12).toFloat())
+                    outline.setAlpha(1f)
+                }
+            }
+            clipToOutline = true
+        }
+
+        override fun onMeasure(w: Int, h: Int) {
+            val width = MeasureSpec.getSize(w)
+            super.onMeasure(
+                MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(width * 9 / 16, MeasureSpec.EXACTLY))
+        }
+    }
+
+    private fun makeCell(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(4), dp(4), dp(4), dp(4))
+        addView(Tile(this@MainActivity), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        addView(TextView(this@MainActivity).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, dp(10), 0, 0)
+        })
+    }
+
+    // Prefer the app's TV banner, which is what Android TV apps supply for exactly this slot.
+    private fun loadArt(e: Entry) {
+        if (e.art != null) return
+        val pm = packageManager
+        val ai = e.info.activityInfo
+        val banner = ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)
+        if (banner != null) {
+            e.art = banner
+            e.isBanner = true
+        } else {
+            e.art = e.info.loadIcon(pm)
+            e.isBanner = false
+        }
+    }
+
+    private fun ring(color: Int) = GradientDrawable().apply {
+        setStroke(dp(4), color)
+        cornerRadius = dp(12).toFloat()
+    }
+
+    // Focused tile: zoom, lift above neighbours (with shadow), white ring, bright label.
+    private fun applyStyle(cell: LinearLayout, focused: Boolean, animate: Boolean) {
+        val tile = cell.getChildAt(0) as Tile
+        val label = cell.getChildAt(1) as TextView
+        val scale = if (focused) 1.12f else 1f
+        val lift = if (focused) dp(20).toFloat() else 0f
+        val labelAlpha = if (focused) 1f else 0.6f
+        tile.foreground = if (focused) ring(if (movingPos >= 0) MOVING else Color.WHITE) else null
+        cell.animate().cancel()
+        label.animate().cancel()
+        if (animate) {
+            cell.animate().scaleX(scale).scaleY(scale).translationZ(lift).setDuration(140).start()
+            label.animate().alpha(labelAlpha).setDuration(140).start()
+        } else {
+            cell.scaleX = scale
+            cell.scaleY = scale
+            cell.translationZ = lift
+            label.alpha = labelAlpha
+        }
+    }
+
+    private fun styleAll() {
+        for (i in 0 until grid.childCount) {
+            val pos = grid.firstVisiblePosition + i
+            applyStyle(grid.getChildAt(i) as LinearLayout,
+                pos == grid.selectedItemPosition && grid.hasFocus(), true)
+        }
+    }
+
     private inner class AppAdapter : BaseAdapter() {
         override fun getCount() = entries.size
         override fun getItem(p: Int) = entries[p]
         override fun getItemId(p: Int) = p.toLong()
 
         override fun getView(p: Int, convert: View?, parent: ViewGroup): View {
-            val v = convert as? LinearLayout ?: LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(dp(6), dp(12), dp(6), dp(10))
-                background = GradientDrawable().apply {
-                    setColor(0x14FFFFFF)
-                    cornerRadius = dp(12).toFloat()
-                }
-                addView(ImageView(context), LinearLayout.LayoutParams(dp(52), dp(52)))
-                addView(TextView(context).apply {
-                    setTextColor(Color.WHITE)
-                    textSize = 12f
-                    gravity = Gravity.CENTER
-                    maxLines = 1
-                    ellipsize = TextUtils.TruncateAt.END
-                    setPadding(0, dp(6), 0, 0)
-                })
-            }
+            val cell = convert as? LinearLayout ?: makeCell()
+            val tile = cell.getChildAt(0) as Tile
+            val label = cell.getChildAt(1) as TextView
             val e = entries[p]
-            (v.getChildAt(0) as ImageView).setImageDrawable(
-                e.icon ?: e.info.loadIcon(packageManager).also { e.icon = it })
-            (v.getChildAt(1) as TextView).text = e.label
-            v.alpha = if (p == movingPos) 0.7f else 1f
-            return v
+            loadArt(e)
+            tile.art.setImageDrawable(e.art)
+            if (e.isBanner) {
+                tile.art.scaleType = ImageView.ScaleType.CENTER_CROP
+                tile.art.setPadding(0, 0, 0, 0)
+                tile.setBackgroundColor(Color.BLACK)
+            } else {
+                tile.art.scaleType = ImageView.ScaleType.FIT_CENTER
+                tile.art.setPadding(dp(18), dp(18), dp(18), dp(18))
+                tile.setBackgroundColor(0xFF262B3B.toInt())
+            }
+            label.text = e.label
+            applyStyle(cell, p == grid.selectedItemPosition && grid.hasFocus(), false)
+            return cell
         }
     }
 }
 
-// Dark diagonal gradient with two soft colour glows, so the screen isn't flat black.
+// Smooth deep-blue to violet gradient with soft glows and a dark floor, dithered to avoid banding.
 private class Backdrop : Drawable() {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isDither = true }
     private var shaders: List<Shader> = emptyList()
 
     override fun onBoundsChange(b: Rect) {
         val w = b.width().toFloat()
         val h = b.height().toFloat()
-        fun glow(cx: Float, cy: Float, r: Float, color: Int): Shader =
-            RadialGradient(cx, cy, r, color, color and 0x00FFFFFF, Shader.TileMode.CLAMP)
+        fun glow(cx: Float, cy: Float, r: Float, rgb: Int, a: Int): Shader =
+            RadialGradient(cx, cy, r,
+                intArrayOf((a shl 24) or rgb, ((a / 3) shl 24) or rgb, rgb),
+                floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP)
         shaders = listOf(
-            LinearGradient(0f, 0f, w, h, 0xFF0B1020.toInt(), 0xFF1E1236.toInt(), Shader.TileMode.CLAMP),
-            glow(w * 0.88f, h * 0.05f, w * 0.50f, 0x40FFC107),
-            glow(w * 0.08f, h * 0.95f, w * 0.60f, 0x483D5AFE)
+            LinearGradient(0f, 0f, 0f, h,
+                intArrayOf(0xFF1A2556.toInt(), 0xFF22184A.toInt(), 0xFF07080F.toInt()),
+                floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP),
+            glow(w * 0.15f, -h * 0.05f, w * 0.75f, 0x5B7CFF, 0x55),
+            glow(w * 0.95f, h * 0.40f, w * 0.60f, 0xB06AFF, 0x38),
+            glow(w * 0.50f, h * 1.05f, w * 0.80f, 0x000000, 0x90)
         )
     }
 
