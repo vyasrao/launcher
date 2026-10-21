@@ -1,11 +1,21 @@
 package com.vedav.launcher
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ResolveInfo
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.RadialGradient
+import android.graphics.Rect
+import android.graphics.Shader
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
@@ -17,6 +27,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.*
 import java.util.Collections
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
 
@@ -33,6 +47,12 @@ class MainActivity : Activity() {
     private var movingPos = -1
     private var swallowUp = false
 
+    private lateinit var stats: TextView
+    private var sampler: ScheduledExecutorService? = null
+    private var prevBusy = -1L
+    private var prevTotal = -1L
+    private var dumpsysFailed = false
+
     private val prefs by lazy { getSharedPreferences("layout", MODE_PRIVATE) }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -48,16 +68,27 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
+            background = Backdrop()
             setPadding(dp(48), dp(32), dp(48), dp(16))
         }
 
-        root.addView(TextClock(this).apply {
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        top.addView(TextClock(this).apply {
             format12Hour = "h:mm a"
             format24Hour = "HH:mm"
             setTextColor(Color.WHITE)
             textSize = 36f
-        })
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        stats = TextView(this).apply {
+            setTextColor(0xFFB0BEC5.toInt())
+            textSize = 16f
+            gravity = Gravity.END
+        }
+        top.addView(stats)
+        root.addView(top)
 
         grid = GridView(this).apply {
             numColumns = COLS
@@ -65,6 +96,7 @@ class MainActivity : Activity() {
             verticalSpacing = dp(16)
             horizontalSpacing = dp(16)
             clipToPadding = false
+            drawSelectorOnTop = true
             setPadding(0, dp(24), 0, dp(24))
             selector = selector(NORMAL)
             adapter = AppAdapter()
@@ -81,10 +113,12 @@ class MainActivity : Activity() {
         super.onResume()
         load()
         grid.requestFocus()
+        startStats()
     }
 
     override fun onPause() {
         super.onPause()
+        stopStats()
         if (movingPos >= 0) stopMove()
     }
 
@@ -122,6 +156,80 @@ class MainActivity : Activity() {
             }
         }
         return true
+    }
+
+    private fun startStats() {
+        stopStats()
+        prevBusy = -1L
+        prevTotal = -1L
+        dumpsysFailed = false
+        sampler = Executors.newSingleThreadScheduledExecutor().also {
+            it.scheduleWithFixedDelay({
+                val text = try { statsText() } catch (_: Exception) { "" }
+                runOnUiThread { stats.text = text }
+            }, 0, 3, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun stopStats() {
+        sampler?.shutdownNow()
+        sampler = null
+    }
+
+    private fun statsText(): String {
+        val mi = ActivityManager.MemoryInfo()
+        (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+        val gb = 1024.0 * 1024 * 1024
+        val ram = String.format(Locale.US, "RAM %.2f / %.2f GB",
+            (mi.totalMem - mi.availMem) / gb, mi.totalMem / gb)
+        return ram + ",  " + cpuText()
+    }
+
+    private fun cpuText(): String {
+        // 1) /proc/stat: instant usage, but Android 8+ usually blocks apps from reading it.
+        val s = readProcStat()
+        if (s != null) {
+            val pct = if (prevTotal >= 0 && s[1] > prevTotal)
+                ((s[0] - prevBusy) * 100 / (s[1] - prevTotal)).toInt() else null
+            prevBusy = s[0]
+            prevTotal = s[1]
+            return if (pct != null) "CPU $pct%" else "CPU ..."
+        }
+        // 2) dumpsys cpuinfo: needs: adb shell pm grant com.vedav.launcher android.permission.DUMP
+        if (!dumpsysFailed) {
+            val d = cpuFromDumpsys()
+            if (d != null) return "CPU $d (recent avg)"
+            dumpsysFailed = true
+        }
+        // 3) Load average as a rough proxy.
+        return try {
+            val l = java.io.File("/proc/loadavg").readText().trim().split(" ")[0]
+            "CPU load $l (${Runtime.getRuntime().availableProcessors()} cores)"
+        } catch (_: Exception) {
+            "CPU n/a"
+        }
+    }
+
+    private fun readProcStat(): LongArray? = try {
+        val line = java.io.File("/proc/stat").bufferedReader().use { it.readLine() }
+        val p = line?.trim()?.split(Regex("\\s+"))
+        if (p == null || p.size < 6 || p[0] != "cpu") null else {
+            val v = p.drop(1).take(8).map { it.toLong() }
+            val total = v.sum()
+            val idle = v[3] + v[4]
+            longArrayOf(total - idle, total)
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun cpuFromDumpsys(): String? = try {
+        val proc = ProcessBuilder("dumpsys", "cpuinfo").redirectErrorStream(true).start()
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.destroy()
+        Regex("""([\d.]+)%\s+TOTAL""").find(out)?.groupValues?.get(1)?.let { "$it%" }
+    } catch (_: Exception) {
+        null
     }
 
     private fun load() {
@@ -204,6 +312,10 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
                 setPadding(dp(8), dp(16), dp(8), dp(12))
+                background = GradientDrawable().apply {
+                    setColor(0x14FFFFFF)
+                    cornerRadius = dp(12).toFloat()
+                }
                 addView(ImageView(context), LinearLayout.LayoutParams(dp(72), dp(72)))
                 addView(TextView(context).apply {
                     setTextColor(Color.WHITE)
@@ -221,4 +333,34 @@ class MainActivity : Activity() {
             return v
         }
     }
+}
+
+// Dark diagonal gradient with two soft colour glows, so the screen isn't flat black.
+private class Backdrop : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var shaders: List<Shader> = emptyList()
+
+    override fun onBoundsChange(b: Rect) {
+        val w = b.width().toFloat()
+        val h = b.height().toFloat()
+        fun glow(cx: Float, cy: Float, r: Float, color: Int): Shader =
+            RadialGradient(cx, cy, r, color, color and 0x00FFFFFF, Shader.TileMode.CLAMP)
+        shaders = listOf(
+            LinearGradient(0f, 0f, w, h, 0xFF0B1020.toInt(), 0xFF1E1236.toInt(), Shader.TileMode.CLAMP),
+            glow(w * 0.88f, h * 0.05f, w * 0.50f, 0x40FFC107),
+            glow(w * 0.08f, h * 0.95f, w * 0.60f, 0x483D5AFE)
+        )
+    }
+
+    override fun draw(canvas: Canvas) {
+        for (sh in shaders) {
+            paint.shader = sh
+            canvas.drawRect(bounds, paint)
+        }
+    }
+
+    override fun setAlpha(alpha: Int) {}
+    override fun setColorFilter(cf: ColorFilter?) {}
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity() = PixelFormat.OPAQUE
 }
