@@ -1,6 +1,7 @@
 package com.vedav.launcher
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ResolveInfo
@@ -11,18 +12,36 @@ import android.os.Bundle
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import java.util.Collections
 
 class MainActivity : Activity() {
 
     private class Entry(val label: String, val pkg: String, val cls: String, val info: ResolveInfo)
 
+    private companion object {
+        const val COLS = 6
+        const val NORMAL = Color.WHITE
+        const val MOVING = 0xFFFFC107.toInt()
+    }
+
     private val entries = mutableListOf<Entry>()
     private lateinit var grid: GridView
+    private var movingPos = -1
+    private var swallowUp = false
+
+    private val prefs by lazy { getSharedPreferences("layout", MODE_PRIVATE) }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun selector(color: Int) = GradientDrawable().apply {
+        setColor(0x33FFFFFF)
+        cornerRadius = dp(12).toFloat()
+        setStroke(dp(2), color)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,29 +52,24 @@ class MainActivity : Activity() {
             setPadding(dp(48), dp(32), dp(48), dp(16))
         }
 
-        val clock = TextClock(this).apply {
+        root.addView(TextClock(this).apply {
             format12Hour = "h:mm a"
             format24Hour = "HH:mm"
             setTextColor(Color.WHITE)
             textSize = 36f
-        }
-        root.addView(clock)
+        })
 
         grid = GridView(this).apply {
-            numColumns = 6
+            numColumns = COLS
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
             verticalSpacing = dp(16)
             horizontalSpacing = dp(16)
             clipToPadding = false
             setPadding(0, dp(24), 0, dp(24))
-            selector = GradientDrawable().apply {
-                setColor(0x33FFFFFF)
-                cornerRadius = dp(12).toFloat()
-                setStroke(dp(2), Color.WHITE)
-            }
+            selector = selector(NORMAL)
             adapter = AppAdapter()
             setOnItemClickListener { _, _, pos, _ -> launch(entries[pos]) }
-            setOnItemLongClickListener { _, _, pos, _ -> details(entries[pos]); true }
+            setOnItemLongClickListener { _, _, pos, _ -> menu(pos); true }
         }
         root.addView(grid, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -69,8 +83,46 @@ class MainActivity : Activity() {
         grid.requestFocus()
     }
 
-    // Home is the launcher, so Back does nothing.
+    override fun onPause() {
+        super.onPause()
+        if (movingPos >= 0) stopMove()
+    }
+
+    // Home is the launcher, so Back does nothing outside move mode.
     override fun onBackPressed() {}
+
+    override fun dispatchKeyEvent(ev: KeyEvent): Boolean {
+        if (ev.action == KeyEvent.ACTION_UP && swallowUp) {
+            swallowUp = false
+            return true
+        }
+        if (movingPos < 0) return super.dispatchKeyEvent(ev)
+
+        if (ev.action == KeyEvent.ACTION_DOWN) {
+            val delta = when (ev.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> -1
+                KeyEvent.KEYCODE_DPAD_RIGHT -> 1
+                KeyEvent.KEYCODE_DPAD_UP -> -COLS
+                KeyEvent.KEYCODE_DPAD_DOWN -> COLS
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_BACK -> {
+                    stopMove()
+                    swallowUp = true
+                    return true
+                }
+                else -> return super.dispatchKeyEvent(ev)
+            }
+            val to = movingPos + delta
+            if (to in entries.indices) {
+                Collections.swap(entries, movingPos, to)
+                movingPos = to
+                (grid.adapter as BaseAdapter).notifyDataSetChanged()
+                grid.setSelection(to)
+            }
+        }
+        return true
+    }
 
     private fun load() {
         val pm = packageManager
@@ -86,8 +138,41 @@ class MainActivity : Activity() {
         found.values.mapTo(entries) {
             Entry(it.loadLabel(pm).toString(), it.activityInfo.packageName, it.activityInfo.name, it)
         }
-        entries.sortBy { it.label.lowercase() }
+
+        // Saved order first. Newly installed apps go at the end, alphabetically.
+        val saved = (prefs.getString("order", "") ?: "").split("\n").filter { it.isNotEmpty() }
+        val idx = saved.withIndex().associate { it.value to it.index }
+        entries.sortWith(compareBy({ idx[it.pkg] ?: Int.MAX_VALUE }, { it.label.lowercase() }))
+
         (grid.adapter as BaseAdapter).notifyDataSetChanged()
+    }
+
+    private fun saveOrder() {
+        prefs.edit().putString("order", entries.joinToString("\n") { it.pkg }).apply()
+    }
+
+    private fun startMove(pos: Int) {
+        movingPos = pos
+        grid.selector = selector(MOVING)
+        (grid.adapter as BaseAdapter).notifyDataSetChanged()
+        Toast.makeText(this, "Move with arrows, press OK to drop", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun stopMove() {
+        movingPos = -1
+        grid.selector = selector(NORMAL)
+        saveOrder()
+        (grid.adapter as BaseAdapter).notifyDataSetChanged()
+    }
+
+    private fun menu(pos: Int) {
+        val e = entries[pos]
+        AlertDialog.Builder(this)
+            .setTitle(e.label)
+            .setItems(arrayOf("Move", "App info")) { _, which ->
+                if (which == 0) startMove(pos) else details(e)
+            }
+            .show()
     }
 
     private fun launch(e: Entry) {
@@ -100,7 +185,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // Long press: app info page (uninstall, disable, clear cache).
     private fun details(e: Entry) {
         try {
             startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -133,6 +217,7 @@ class MainActivity : Activity() {
             val e = entries[p]
             (v.getChildAt(0) as ImageView).setImageDrawable(e.info.loadIcon(packageManager))
             (v.getChildAt(1) as TextView).text = e.label
+            v.alpha = if (p == movingPos) 0.7f else 1f
             return v
         }
     }
