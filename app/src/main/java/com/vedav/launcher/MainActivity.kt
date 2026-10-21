@@ -20,8 +20,11 @@ import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -60,9 +63,6 @@ class MainActivity : Activity() {
 
     private lateinit var stats: TextView
     private var sampler: ScheduledExecutorService? = null
-    private var prevBusy = -1L
-    private var prevTotal = -1L
-    private var dumpsysFailed = false
 
     private val prefs by lazy { getSharedPreferences("layout", MODE_PRIVATE) }
 
@@ -99,6 +99,9 @@ class MainActivity : Activity() {
             gravity = Gravity.END
         }
         top.addView(stats)
+
+        top.addView(topButton("Clear RAM") { clearRam() }, buttonParams())
+        top.addView(topButton("Settings") { openSettings() }, buttonParams())
         root.addView(top)
 
         grid = GridView(this).apply {
@@ -183,11 +186,51 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun buttonParams() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply { marginStart = dp(16) }
+
+    private fun topButton(label: String, onClick: () -> Unit) = TextView(this).apply {
+        text = label
+        setTextColor(Color.WHITE)
+        textSize = 14f
+        gravity = Gravity.CENTER
+        setPadding(dp(16), dp(8), dp(16), dp(8))
+        isFocusable = true
+        isClickable = true
+        background = StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_focused), GradientDrawable().apply {
+                setColor(0x44FFFFFF)
+                cornerRadius = dp(10).toFloat()
+                setStroke(dp(2), Color.WHITE)
+            })
+            addState(intArrayOf(), GradientDrawable().apply {
+                setColor(0x22FFFFFF)
+                cornerRadius = dp(10).toFloat()
+            })
+        }
+        setOnClickListener { onClick() }
+    }
+
+    private fun openSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {
+            Toast.makeText(this, "Settings unavailable", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // The remote's own Settings key (gear button) opens Settings while the launcher is in front.
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_SETTINGS) {
+            openSettings()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     private fun startStats() {
         stopStats()
-        prevBusy = -1L
-        prevTotal = -1L
-        dumpsysFailed = false
         sampler = Executors.newSingleThreadScheduledExecutor().also {
             it.scheduleWithFixedDelay({
                 val text = try { statsText() } catch (_: Exception) { "" }
@@ -204,57 +247,33 @@ class MainActivity : Activity() {
     private fun statsText(): String {
         val mi = ActivityManager.MemoryInfo()
         (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+        val fs = StatFs(Environment.getDataDirectory().path)
         val gb = 1024.0 * 1024 * 1024
-        val ram = String.format(Locale.US, "RAM %.2f / %.2f GB",
-            (mi.totalMem - mi.availMem) / gb, mi.totalMem / gb)
-        return ram + ",  " + cpuText()
+        return String.format(Locale.US, "RAM %.2f / %.2f GB,  Free space %.2f / %.2f GB",
+            (mi.totalMem - mi.availMem) / gb, mi.totalMem / gb,
+            fs.availableBytes / gb, fs.totalBytes / gb)
     }
 
-    private fun cpuText(): String {
-        // 1) /proc/stat: instant usage, but Android 8+ usually blocks apps from reading it.
-        val s = readProcStat()
-        if (s != null) {
-            val pct = if (prevTotal >= 0 && s[1] > prevTotal)
-                ((s[0] - prevBusy) * 100 / (s[1] - prevTotal)).toInt() else null
-            prevBusy = s[0]
-            prevTotal = s[1]
-            return if (pct != null) "CPU $pct%" else "CPU ..."
-        }
-        // 2) dumpsys cpuinfo: needs: adb shell pm grant com.vedav.launcher android.permission.DUMP
-        if (!dumpsysFailed) {
-            val d = cpuFromDumpsys()
-            if (d != null) return "CPU $d (recent avg)"
-            dumpsysFailed = true
-        }
-        // 3) Load average as a rough proxy.
-        return try {
-            val l = java.io.File("/proc/loadavg").readText().trim().split(" ")[0]
-            "CPU load $l (${Runtime.getRuntime().availableProcessors()} cores)"
-        } catch (_: Exception) {
-            "CPU n/a"
-        }
-    }
-
-    private fun readProcStat(): LongArray? = try {
-        val line = java.io.File("/proc/stat").bufferedReader().use { it.readLine() }
-        val p = line?.trim()?.split(Regex("\\s+"))
-        if (p == null || p.size < 6 || p[0] != "cpu") null else {
-            val v = p.drop(1).take(8).map { it.toLong() }
-            val total = v.sum()
-            val idle = v[3] + v[4]
-            longArrayOf(total - idle, total)
-        }
-    } catch (_: Exception) {
-        null
-    }
-
-    private fun cpuFromDumpsys(): String? = try {
-        val proc = ProcessBuilder("dumpsys", "cpuinfo").redirectErrorStream(true).start()
-        val out = proc.inputStream.bufferedReader().use { it.readText() }
-        proc.destroy()
-        Regex("""([\d.]+)%\s+TOTAL""").find(out)?.groupValues?.get(1)?.let { "$it%" }
-    } catch (_: Exception) {
-        null
+    // Asks Android to kill background processes of every other app. Foreground and
+    // system-critical processes are left alone, and some apps will restart themselves.
+    private fun clearRam() {
+        Toast.makeText(this, "Clearing RAM...", Toast.LENGTH_SHORT).show()
+        val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        Thread {
+            for (ai in packageManager.getInstalledApplications(0)) {
+                if (ai.packageName != packageName) am.killBackgroundProcesses(ai.packageName)
+            }
+            Thread.sleep(800)
+            val mi = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            val text = try { statsText() } catch (_: Exception) { "" }
+            runOnUiThread {
+                stats.text = text
+                Toast.makeText(this,
+                    String.format(Locale.US, "Free RAM: %.2f GB", mi.availMem / 1024.0 / 1024 / 1024),
+                    Toast.LENGTH_SHORT).show()
+            }
+        }.start()
     }
 
     private fun load() {
