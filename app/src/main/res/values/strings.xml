@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="redirect_desc">Opens Quiet Launcher when the stock launcher appears.</string>
+</resources>
