@@ -3,8 +3,11 @@ package com.vedav.launcher
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ResolveInfo
 import android.graphics.Canvas
 import android.graphics.Color
@@ -34,10 +37,12 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
 
-    private class Entry(val label: String, val pkg: String, val cls: String, val info: ResolveInfo)
+    private class Entry(val label: String, val pkg: String, val cls: String, val info: ResolveInfo) {
+        var icon: Drawable? = null
+    }
 
     private companion object {
-        const val COLS = 6
+        const val COLS = 8
         const val NORMAL = Color.WHITE
         const val MOVING = 0xFFFFC107.toInt()
     }
@@ -46,6 +51,12 @@ class MainActivity : Activity() {
     private lateinit var grid: GridView
     private var movingPos = -1
     private var swallowUp = false
+
+    // The app list is only rebuilt when something is installed, removed or changed.
+    private var dirty = true
+    private val pkgReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) { dirty = true }
+    }
 
     private lateinit var stats: TextView
     private var sampler: ScheduledExecutorService? = null
@@ -106,11 +117,26 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+
+        registerReceiver(pkgReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addDataScheme("package")
+        })
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(pkgReceiver)
     }
 
     override fun onResume() {
         super.onResume()
-        load()
+        if (dirty || entries.isEmpty()) {
+            load()
+            dirty = false
+        }
         grid.requestFocus()
         startStats()
     }
@@ -310,23 +336,24 @@ class MainActivity : Activity() {
             val v = convert as? LinearLayout ?: LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setPadding(dp(8), dp(16), dp(8), dp(12))
+                setPadding(dp(6), dp(12), dp(6), dp(10))
                 background = GradientDrawable().apply {
                     setColor(0x14FFFFFF)
                     cornerRadius = dp(12).toFloat()
                 }
-                addView(ImageView(context), LinearLayout.LayoutParams(dp(72), dp(72)))
+                addView(ImageView(context), LinearLayout.LayoutParams(dp(52), dp(52)))
                 addView(TextView(context).apply {
                     setTextColor(Color.WHITE)
-                    textSize = 14f
+                    textSize = 12f
                     gravity = Gravity.CENTER
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
-                    setPadding(0, dp(8), 0, 0)
+                    setPadding(0, dp(6), 0, 0)
                 })
             }
             val e = entries[p]
-            (v.getChildAt(0) as ImageView).setImageDrawable(e.info.loadIcon(packageManager))
+            (v.getChildAt(0) as ImageView).setImageDrawable(
+                e.icon ?: e.info.loadIcon(packageManager).also { e.icon = it })
             (v.getChildAt(1) as TextView).text = e.label
             v.alpha = if (p == movingPos) 0.7f else 1f
             return v
