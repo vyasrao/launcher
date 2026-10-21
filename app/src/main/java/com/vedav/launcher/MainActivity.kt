@@ -96,7 +96,6 @@ class MainActivity : Activity() {
             verticalSpacing = dp(16)
             horizontalSpacing = dp(16)
             clipToPadding = false
-            drawSelectorOnTop = true
             setPadding(0, dp(24), 0, dp(24))
             selector = selector(NORMAL)
             adapter = AppAdapter()
