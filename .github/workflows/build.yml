@@ -15,6 +15,8 @@ jobs:
         with:
           gradle-version: "8.7"
       - run: gradle assembleDebug
+        env:
+          TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: launcher-apk
