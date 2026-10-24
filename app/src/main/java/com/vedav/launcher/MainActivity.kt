@@ -8,8 +8,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Canvas
 import android.graphics.Color
@@ -52,8 +50,6 @@ class MainActivity : Activity() {
         var isBanner = false
     }
 
-    private class Proc(val pkg: String, val label: String, val mb: Int) // mb = -1 when unknown
-
     private companion object {
         const val COLS = 6
         const val MOVING = 0xFFFFC107.toInt()
@@ -66,7 +62,6 @@ class MainActivity : Activity() {
     private var movingPos = -1
     private var swallowUp = false
     private var sampler: ScheduledExecutorService? = null
-    private var lastDiag = ""
 
     // The app list is only rebuilt when something is installed, removed or changed.
     private var dirty = true
@@ -105,7 +100,6 @@ class MainActivity : Activity() {
         }
         top.addView(stats)
         top.addView(topButton("Clear RAM") { clearRam() }, buttonParams())
-        top.addView(topButton("Running apps") { showRunning() }, buttonParams())
         top.addView(iconButton(GearDrawable(Color.WHITE), "Settings") { openSettings() },
             LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(16) })
         root.addView(top)
@@ -310,145 +304,6 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- running apps ----------
-
-    private fun runCmd(vararg cmd: String): String {
-        val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-        val text = p.inputStream.bufferedReader().use { it.readText() }
-        p.destroy()
-        return text
-    }
-
-    private fun acceptPkg(pkg: String) = '.' in pkg && !pkg.startsWith("/") && pkg != packageName
-
-    // `dumpsys meminfo`: package -> KB. Needs DUMP and PACKAGE_USAGE_STATS.
-    private fun parseMeminfo(text: String): LinkedHashMap<String, Long> {
-        val out = LinkedHashMap<String, Long>()
-        val start = text.indexOf("Total PSS by process:")
-        if (start < 0) return out
-        val end = text.indexOf("Total PSS by OOM adjustment:", start)
-        val section = text.substring(start, if (end > start) end else text.length)
-        val re = Regex("""^\s*([\d.,]+)K:\s+(\S+)\s+\(pid""", RegexOption.MULTILINE)
-        for (m in re.findAll(section)) {
-            val kb = m.groupValues[1].filter { it.isDigit() }.toLongOrNull() ?: continue
-            val pkg = m.groupValues[2].substringBefore(':')
-            if (acceptPkg(pkg)) out[pkg] = (out[pkg] ?: 0L) + kb
-        }
-        return out
-    }
-
-    // `dumpsys activity processes`: package -> -1 (no memory info). Needs only DUMP.
-    private fun parseProcesses(text: String): LinkedHashMap<String, Long> {
-        val out = LinkedHashMap<String, Long>()
-        val re = Regex("""\b\d+:([A-Za-z0-9_.]+)(?::[A-Za-z0-9_.]+)?/u\d+a\d+""")
-        for (m in re.findAll(text)) {
-            val pkg = m.groupValues[1]
-            if (acceptPkg(pkg) && !out.containsKey(pkg)) out[pkg] = -1L
-        }
-        return out
-    }
-
-    private fun readRunning(): List<Proc>? {
-        val diag = StringBuilder()
-        var map = LinkedHashMap<String, Long>()
-        try {
-            val t = runCmd("dumpsys", "meminfo")
-            map = parseMeminfo(t)
-            if (map.isEmpty()) diag.append("meminfo: ").append(t.trim().take(200)).append("\n\n")
-        } catch (e: Exception) {
-            diag.append("meminfo error: ").append(e.toString().take(200)).append("\n\n")
-        }
-        if (map.isEmpty()) {
-            try {
-                val t = runCmd("dumpsys", "activity", "processes")
-                map = parseProcesses(t)
-                if (map.isEmpty()) diag.append("activity: ").append(t.trim().take(200)).append("\n\n")
-            } catch (e: Exception) {
-                diag.append("activity error: ").append(e.toString().take(200)).append("\n\n")
-            }
-        }
-        lastDiag = diag.toString()
-        if (map.isEmpty()) return null
-
-        val pm = packageManager
-        val out = ArrayList<Proc>()
-        for ((pkg, kb) in map) {
-            val ai = try { pm.getApplicationInfo(pkg, 0) } catch (_: PackageManager.NameNotFoundException) { null }
-            if (ai != null && (ai.flags and ApplicationInfo.FLAG_PERSISTENT) != 0) continue
-            out.add(Proc(pkg, ai?.loadLabel(pm)?.toString() ?: pkg, if (kb < 0) -1 else (kb / 1024).toInt()))
-        }
-        out.sortByDescending { it.mb }
-        return out.take(30)
-    }
-
-    private fun showRunning() {
-        Toast.makeText(this, "Reading running apps...", Toast.LENGTH_SHORT).show()
-        Thread {
-            val list = try { readRunning() } catch (_: Exception) { null }
-            runOnUiThread { presentRunning(list) }
-        }.start()
-    }
-
-    private fun presentRunning(first: List<Proc>?) {
-        if (first == null) {
-            AlertDialog.Builder(this)
-                .setTitle("Can't read running apps")
-                .setMessage("What the system returned:\n\n" + lastDiag.ifBlank { "(nothing)" } +
-                    "Needed once from your PC:\nadb shell pm grant com.vedav.launcher android.permission.DUMP\n" +
-                    "adb shell pm grant com.vedav.launcher android.permission.PACKAGE_USAGE_STATS")
-                .setPositiveButton("OK", null)
-                .show()
-            return
-        }
-        if (first.isEmpty()) {
-            Toast.makeText(this, "No other apps are running", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val procs = first.toMutableList()
-        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
-        fun rebind() {
-            adapter.clear()
-            adapter.addAll(procs.map { if (it.mb >= 0) "${it.label}   ${it.mb} MB" else it.label })
-            adapter.notifyDataSetChanged()
-        }
-        rebind()
-
-        val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("Running apps  (OK on an app = kill)")
-            .setAdapter(adapter, null)
-            .setPositiveButton("Kill all", null)
-            .setNegativeButton("Close", null)
-            .create()
-        dlg.show()
-
-        fun kill(targets: List<Proc>) {
-            for (t in targets) am.killBackgroundProcesses(t.pkg)
-            Thread {
-                Thread.sleep(700)
-                val fresh = try { readRunning() } catch (_: Exception) { null }
-                runOnUiThread {
-                    var msg = "Killed ${targets.size}"
-                    if (fresh != null) {
-                        val still = fresh.count { f -> targets.any { it.pkg == f.pkg } }
-                        if (still > 0) msg += ", $still still running (on screen, system, or restarted)"
-                        procs.clear()
-                        procs.addAll(fresh)
-                        rebind()
-                    }
-                    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-                }
-            }.start()
-        }
-
-        // Replace the default handlers so the dialog stays open after each kill.
-        dlg.listView.setOnItemClickListener { _, _, pos, _ ->
-            if (pos in procs.indices) kill(listOf(procs[pos]))
-        }
-        dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { kill(procs.toList()) }
-    }
-
     // ---------- apps ----------
 
     private fun load() {
@@ -569,27 +424,27 @@ class MainActivity : Activity() {
     }
 
     private fun ring(color: Int) = GradientDrawable().apply {
-        setStroke(dp(3), color) // half is clipped by the tile outline, so about 1.5dp shows
+        setStroke(dp(4), color)
         cornerRadius = dp(12).toFloat()
     }
 
-    // Focused tile: soft radiant glow around it, thin bright rim, slight zoom, lifted above neighbours.
+    // Selected tile: enlarged and lifted above its neighbours, everything else slightly dimmed.
+    // The size and brightness difference reads on any artwork, unlike a border.
     private fun applyStyle(cell: FrameLayout, focused: Boolean, animate: Boolean) {
         val tile = cell.getChildAt(0) as Tile
-        val moving = movingPos >= 0
-        val glow = if (moving) 0xFFFFC107.toInt() else 0xFF9DB7FF.toInt()
-        val rim = if (moving) 0xFFFFE082.toInt() else 0xF0FFFFFF.toInt()
-        val scale = if (focused) 1.1f else 1f
-        val lift = if (focused) dp(20).toFloat() else 0f
-        cell.background = if (focused) GlowDrawable(glow, dp(GLOW).toFloat(), dp(12).toFloat()) else null
-        tile.foreground = if (focused) ring(rim) else null
+        val scale = if (focused) 1.3f else 1f
+        val lift = if (focused) dp(24).toFloat() else 0f
+        val alpha = if (focused || !grid.hasFocus()) 1f else 0.65f
+        tile.foreground = if (focused && movingPos >= 0) ring(MOVING) else null // amber ring only while moving
         cell.animate().cancel()
         if (animate) {
-            cell.animate().scaleX(scale).scaleY(scale).translationZ(lift).setDuration(140).start()
+            cell.animate().scaleX(scale).scaleY(scale).translationZ(lift).alpha(alpha)
+                .setDuration(140).start()
         } else {
             cell.scaleX = scale
             cell.scaleY = scale
             cell.translationZ = lift
+            cell.alpha = alpha
         }
     }
 
@@ -660,29 +515,6 @@ private class Backdrop : Drawable() {
     override fun setColorFilter(cf: ColorFilter?) {}
     @Suppress("OVERRIDE_DEPRECATION")
     override fun getOpacity() = PixelFormat.OPAQUE
-}
-
-// Layered rounded rectangles that fade outward, giving a soft radiant halo.
-private class GlowDrawable(private val color: Int, private val pad: Float, private val radius: Float) : Drawable() {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-    override fun draw(canvas: Canvas) {
-        val b = bounds
-        val steps = 10
-        for (i in 0 until steps) { // outermost layer first, brighter toward the tile
-            val t = i / steps.toFloat()
-            val inset = pad * t
-            val alpha = (0x50 * t * t).toInt()
-            paint.color = (alpha shl 24) or (color and 0xFFFFFF)
-            val r = radius + pad * (1f - t)
-            canvas.drawRoundRect(b.left + inset, b.top + inset, b.right - inset, b.bottom - inset, r, r, paint)
-        }
-    }
-
-    override fun setAlpha(alpha: Int) {}
-    override fun setColorFilter(cf: ColorFilter?) {}
-    @Suppress("OVERRIDE_DEPRECATION")
-    override fun getOpacity() = PixelFormat.TRANSLUCENT
 }
 
 // Settings gear, drawn in code so it needs no image file.
