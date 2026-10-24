@@ -12,9 +12,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-        buildConfigField("String", "TMDB_TOKEN", "\"${System.getenv("TMDB_TOKEN") ?: ""}\"")
     }
-    buildFeatures { buildConfig = true }
     signingConfigs {
         getByName("debug") {
             storeFile = file("debug.keystore")
