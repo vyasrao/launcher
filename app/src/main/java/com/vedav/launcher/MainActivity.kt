@@ -15,8 +15,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.Rect
@@ -50,11 +52,12 @@ class MainActivity : Activity() {
         var isBanner = false
     }
 
-    private class Proc(val pkg: String, val label: String, val mb: Int)
+    private class Proc(val pkg: String, val label: String, val mb: Int) // mb = -1 when unknown
 
     private companion object {
         const val COLS = 6
         const val MOVING = 0xFFFFC107.toInt()
+        const val GLOW = 12
     }
 
     private val entries = mutableListOf<Entry>()
@@ -63,6 +66,7 @@ class MainActivity : Activity() {
     private var movingPos = -1
     private var swallowUp = false
     private var sampler: ScheduledExecutorService? = null
+    private var lastDiag = ""
 
     // The app list is only rebuilt when something is installed, removed or changed.
     private var dirty = true
@@ -102,17 +106,18 @@ class MainActivity : Activity() {
         top.addView(stats)
         top.addView(topButton("Clear RAM") { clearRam() }, buttonParams())
         top.addView(topButton("Running apps") { showRunning() }, buttonParams())
-        top.addView(topButton("Settings") { openSettings() }, buttonParams())
+        top.addView(iconButton(GearDrawable(Color.WHITE), "Settings") { openSettings() },
+            LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(16) })
         root.addView(top)
 
         grid = GridView(this).apply {
             numColumns = COLS
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            verticalSpacing = dp(24)
-            horizontalSpacing = dp(20)
+            verticalSpacing = dp(4)
+            horizontalSpacing = dp(4)
             clipToPadding = false
             clipChildren = false
-            setPadding(dp(8), dp(28), dp(8), dp(28))
+            setPadding(dp(4), dp(20), dp(4), dp(24))
             selector = ColorDrawable(Color.TRANSPARENT)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) { styleAll() }
@@ -216,6 +221,18 @@ class MainActivity : Activity() {
         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
     ).apply { marginStart = dp(16) }
 
+    private fun buttonBg() = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_focused), GradientDrawable().apply {
+            setColor(0x44FFFFFF)
+            cornerRadius = dp(10).toFloat()
+            setStroke(dp(2), Color.WHITE)
+        })
+        addState(intArrayOf(), GradientDrawable().apply {
+            setColor(0x22FFFFFF)
+            cornerRadius = dp(10).toFloat()
+        })
+    }
+
     private fun topButton(label: String, onClick: () -> Unit) = TextView(this).apply {
         text = label
         setTextColor(Color.WHITE)
@@ -224,17 +241,17 @@ class MainActivity : Activity() {
         setPadding(dp(16), dp(8), dp(16), dp(8))
         isFocusable = true
         isClickable = true
-        background = StateListDrawable().apply {
-            addState(intArrayOf(android.R.attr.state_focused), GradientDrawable().apply {
-                setColor(0x44FFFFFF)
-                cornerRadius = dp(10).toFloat()
-                setStroke(dp(2), Color.WHITE)
-            })
-            addState(intArrayOf(), GradientDrawable().apply {
-                setColor(0x22FFFFFF)
-                cornerRadius = dp(10).toFloat()
-            })
-        }
+        background = buttonBg()
+        setOnClickListener { onClick() }
+    }
+
+    private fun iconButton(icon: Drawable, desc: String, onClick: () -> Unit) = ImageView(this).apply {
+        setImageDrawable(icon)
+        contentDescription = desc
+        setPadding(dp(9), dp(9), dp(9), dp(9))
+        isFocusable = true
+        isClickable = true
+        background = buttonBg()
         setOnClickListener { onClick() }
     }
 
@@ -266,7 +283,7 @@ class MainActivity : Activity() {
         (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
         val fs = StatFs(Environment.getDataDirectory().path)
         val gb = 1024.0 * 1024 * 1024
-        return String.format(Locale.US, "RAM %.2f / %.2f GB,  Free space %.2f / %.2f GB",
+        return String.format(Locale.US, "RAM %.2f / %.2f GB,  Storage %.2f / %.2f GB",
             (mi.totalMem - mi.availMem) / gb, mi.totalMem / gb,
             fs.availableBytes / gb, fs.totalBytes / gb)
     }
@@ -295,32 +312,70 @@ class MainActivity : Activity() {
 
     // ---------- running apps ----------
 
-    // Lists apps with live processes and their memory, from `dumpsys meminfo`.
-    // Needs DUMP and PACKAGE_USAGE_STATS, granted once over ADB. Returns null if unreadable.
-    private fun readRunning(): List<Proc>? {
-        val p = ProcessBuilder("dumpsys", "meminfo").redirectErrorStream(true).start()
+    private fun runCmd(vararg cmd: String): String {
+        val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
         val text = p.inputStream.bufferedReader().use { it.readText() }
         p.destroy()
+        return text
+    }
+
+    private fun acceptPkg(pkg: String) = '.' in pkg && !pkg.startsWith("/") && pkg != packageName
+
+    // `dumpsys meminfo`: package -> KB. Needs DUMP and PACKAGE_USAGE_STATS.
+    private fun parseMeminfo(text: String): LinkedHashMap<String, Long> {
+        val out = LinkedHashMap<String, Long>()
         val start = text.indexOf("Total PSS by process:")
-        if (start < 0) return null
+        if (start < 0) return out
         val end = text.indexOf("Total PSS by OOM adjustment:", start)
         val section = text.substring(start, if (end > start) end else text.length)
-
         val re = Regex("""^\s*([\d.,]+)K:\s+(\S+)\s+\(pid""", RegexOption.MULTILINE)
-        val kbByPkg = LinkedHashMap<String, Long>()
         for (m in re.findAll(section)) {
             val kb = m.groupValues[1].filter { it.isDigit() }.toLongOrNull() ?: continue
             val pkg = m.groupValues[2].substringBefore(':')
-            if ('.' !in pkg || pkg.startsWith("/") || pkg == packageName) continue
-            kbByPkg[pkg] = (kbByPkg[pkg] ?: 0L) + kb
+            if (acceptPkg(pkg)) out[pkg] = (out[pkg] ?: 0L) + kb
         }
+        return out
+    }
+
+    // `dumpsys activity processes`: package -> -1 (no memory info). Needs only DUMP.
+    private fun parseProcesses(text: String): LinkedHashMap<String, Long> {
+        val out = LinkedHashMap<String, Long>()
+        val re = Regex("""\b\d+:([A-Za-z0-9_.]+)(?::[A-Za-z0-9_.]+)?/u\d+a\d+""")
+        for (m in re.findAll(text)) {
+            val pkg = m.groupValues[1]
+            if (acceptPkg(pkg) && !out.containsKey(pkg)) out[pkg] = -1L
+        }
+        return out
+    }
+
+    private fun readRunning(): List<Proc>? {
+        val diag = StringBuilder()
+        var map = LinkedHashMap<String, Long>()
+        try {
+            val t = runCmd("dumpsys", "meminfo")
+            map = parseMeminfo(t)
+            if (map.isEmpty()) diag.append("meminfo: ").append(t.trim().take(200)).append("\n\n")
+        } catch (e: Exception) {
+            diag.append("meminfo error: ").append(e.toString().take(200)).append("\n\n")
+        }
+        if (map.isEmpty()) {
+            try {
+                val t = runCmd("dumpsys", "activity", "processes")
+                map = parseProcesses(t)
+                if (map.isEmpty()) diag.append("activity: ").append(t.trim().take(200)).append("\n\n")
+            } catch (e: Exception) {
+                diag.append("activity error: ").append(e.toString().take(200)).append("\n\n")
+            }
+        }
+        lastDiag = diag.toString()
+        if (map.isEmpty()) return null
 
         val pm = packageManager
         val out = ArrayList<Proc>()
-        for ((pkg, kb) in kbByPkg) {
+        for ((pkg, kb) in map) {
             val ai = try { pm.getApplicationInfo(pkg, 0) } catch (_: PackageManager.NameNotFoundException) { null }
             if (ai != null && (ai.flags and ApplicationInfo.FLAG_PERSISTENT) != 0) continue
-            out.add(Proc(pkg, ai?.loadLabel(pm)?.toString() ?: pkg, (kb / 1024).toInt()))
+            out.add(Proc(pkg, ai?.loadLabel(pm)?.toString() ?: pkg, if (kb < 0) -1 else (kb / 1024).toInt()))
         }
         out.sortByDescending { it.mb }
         return out.take(30)
@@ -338,8 +393,8 @@ class MainActivity : Activity() {
         if (first == null) {
             AlertDialog.Builder(this)
                 .setTitle("Can't read running apps")
-                .setMessage("Android hides this from apps by default. Run these two commands once from your PC, then try again:\n\n" +
-                    "adb shell pm grant com.vedav.launcher android.permission.DUMP\n" +
+                .setMessage("What the system returned:\n\n" + lastDiag.ifBlank { "(nothing)" } +
+                    "Needed once from your PC:\nadb shell pm grant com.vedav.launcher android.permission.DUMP\n" +
                     "adb shell pm grant com.vedav.launcher android.permission.PACKAGE_USAGE_STATS")
                 .setPositiveButton("OK", null)
                 .show()
@@ -354,7 +409,7 @@ class MainActivity : Activity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
         fun rebind() {
             adapter.clear()
-            adapter.addAll(procs.map { "${it.label}   ${it.mb} MB" })
+            adapter.addAll(procs.map { if (it.mb >= 0) "${it.label}   ${it.mb} MB" else it.label })
             adapter.notifyDataSetChanged()
         }
         rebind()
@@ -490,19 +545,12 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun makeCell(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(6), dp(6), dp(6), dp(6))
-        addView(Tile(this@MainActivity), LinearLayout.LayoutParams(
+    // Cell = tile plus room around it for the glow. No text label.
+    private fun makeCell(): FrameLayout = FrameLayout(this).apply {
+        val pad = dp(GLOW)
+        setPadding(pad, pad, pad, pad)
+        addView(Tile(this@MainActivity), FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        addView(TextView(this@MainActivity).apply {
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            gravity = Gravity.CENTER
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, dp(8), 0, 0)
-        })
     }
 
     // Prefer the app's TV banner, which is what Android TV apps supply for exactly this slot.
@@ -520,38 +568,35 @@ class MainActivity : Activity() {
         }
     }
 
-    // Thin dotted frame around tile and label, with a faint fill so it shows on any artwork.
-    private fun frame(color: Int) = GradientDrawable().apply {
-        setColor(0x22FFFFFF)
-        cornerRadius = dp(14).toFloat()
-        setStroke(dp(2), color, dp(5).toFloat(), dp(4).toFloat())
+    private fun ring(color: Int) = GradientDrawable().apply {
+        setStroke(dp(3), color) // half is clipped by the tile outline, so about 1.5dp shows
+        cornerRadius = dp(12).toFloat()
     }
 
-    // Focused tile: zoom, lift above neighbours, dotted frame, bright label.
-    private fun applyStyle(cell: LinearLayout, focused: Boolean, animate: Boolean) {
-        val label = cell.getChildAt(1) as TextView
-        val color = if (movingPos >= 0) MOVING else Color.WHITE
-        val scale = if (focused) 1.12f else 1f
+    // Focused tile: soft radiant glow around it, thin bright rim, slight zoom, lifted above neighbours.
+    private fun applyStyle(cell: FrameLayout, focused: Boolean, animate: Boolean) {
+        val tile = cell.getChildAt(0) as Tile
+        val moving = movingPos >= 0
+        val glow = if (moving) 0xFFFFC107.toInt() else 0xFF9DB7FF.toInt()
+        val rim = if (moving) 0xFFFFE082.toInt() else 0xF0FFFFFF.toInt()
+        val scale = if (focused) 1.1f else 1f
         val lift = if (focused) dp(20).toFloat() else 0f
-        val labelAlpha = if (focused) 1f else 0.6f
-        cell.background = if (focused) frame(color) else null
+        cell.background = if (focused) GlowDrawable(glow, dp(GLOW).toFloat(), dp(12).toFloat()) else null
+        tile.foreground = if (focused) ring(rim) else null
         cell.animate().cancel()
-        label.animate().cancel()
         if (animate) {
             cell.animate().scaleX(scale).scaleY(scale).translationZ(lift).setDuration(140).start()
-            label.animate().alpha(labelAlpha).setDuration(140).start()
         } else {
             cell.scaleX = scale
             cell.scaleY = scale
             cell.translationZ = lift
-            label.alpha = labelAlpha
         }
     }
 
     private fun styleAll() {
         for (i in 0 until grid.childCount) {
             val pos = grid.firstVisiblePosition + i
-            applyStyle(grid.getChildAt(i) as LinearLayout,
+            applyStyle(grid.getChildAt(i) as FrameLayout,
                 pos == grid.selectedItemPosition && grid.hasFocus(), true)
         }
     }
@@ -562,9 +607,8 @@ class MainActivity : Activity() {
         override fun getItemId(p: Int) = p.toLong()
 
         override fun getView(p: Int, convert: View?, parent: ViewGroup): View {
-            val cell = convert as? LinearLayout ?: makeCell()
+            val cell = convert as? FrameLayout ?: makeCell()
             val tile = cell.getChildAt(0) as Tile
-            val label = cell.getChildAt(1) as TextView
             val e = entries[p]
             loadArt(e)
             tile.art.setImageDrawable(e.art)
@@ -577,7 +621,6 @@ class MainActivity : Activity() {
                 tile.art.setPadding(dp(18), dp(18), dp(18), dp(18))
                 tile.setBackgroundColor(0xFF262B3B.toInt())
             }
-            label.text = e.label
             applyStyle(cell, p == grid.selectedItemPosition && grid.hasFocus(), false)
             return cell
         }
@@ -617,4 +660,57 @@ private class Backdrop : Drawable() {
     override fun setColorFilter(cf: ColorFilter?) {}
     @Suppress("OVERRIDE_DEPRECATION")
     override fun getOpacity() = PixelFormat.OPAQUE
+}
+
+// Layered rounded rectangles that fade outward, giving a soft radiant halo.
+private class GlowDrawable(private val color: Int, private val pad: Float, private val radius: Float) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun draw(canvas: Canvas) {
+        val b = bounds
+        val steps = 10
+        for (i in 0 until steps) { // outermost layer first, brighter toward the tile
+            val t = i / steps.toFloat()
+            val inset = pad * t
+            val alpha = (0x50 * t * t).toInt()
+            paint.color = (alpha shl 24) or (color and 0xFFFFFF)
+            val r = radius + pad * (1f - t)
+            canvas.drawRoundRect(b.left + inset, b.top + inset, b.right - inset, b.bottom - inset, r, r, paint)
+        }
+    }
+
+    override fun setAlpha(alpha: Int) {}
+    override fun setColorFilter(cf: ColorFilter?) {}
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
+}
+
+// Settings gear, drawn in code so it needs no image file.
+private class GearDrawable(private val color: Int) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun draw(canvas: Canvas) {
+        val s = minOf(bounds.width(), bounds.height()).toFloat()
+        val cx = bounds.exactCenterX()
+        val cy = bounds.exactCenterY()
+        val gear = Path()
+        gear.addCircle(cx, cy, s * 0.34f, Path.Direction.CW)
+        for (i in 0 until 8) {
+            val tooth = Path()
+            tooth.addRoundRect(cx - s * 0.10f, cy - s * 0.48f, cx + s * 0.10f, cy - s * 0.26f,
+                s * 0.04f, s * 0.04f, Path.Direction.CW)
+            tooth.transform(Matrix().apply { setRotate(i * 45f, cx, cy) })
+            gear.addPath(tooth)
+        }
+        val hole = Path()
+        hole.addCircle(cx, cy, s * 0.15f, Path.Direction.CW)
+        gear.op(hole, Path.Op.DIFFERENCE)
+        paint.color = color
+        canvas.drawPath(gear, paint)
+    }
+
+    override fun setAlpha(alpha: Int) {}
+    override fun setColorFilter(cf: ColorFilter?) {}
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity() = PixelFormat.TRANSLUCENT
 }
